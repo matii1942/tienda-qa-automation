@@ -1,0 +1,81 @@
+name: QA
+
+# Brings up the real store (API + MongoDB) with its own docker-compose, seeds it, and runs
+# the suite against it. Two runs: the regression suite, which must pass, and the
+# @known-bug scenarios, which reproduce the defects in BUGS.md and are expected to fail.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Every Monday: catches the store changing underneath the tests.
+    - cron: "17 9 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the test suite
+        uses: actions/checkout@v4
+
+      - name: Check out the store
+        uses: actions/checkout@v4
+        with:
+          repository: matii1942/E-commerce
+          path: store
+
+      - name: Start the store
+        working-directory: store
+        run: |
+          # A throwaway secret: compose refuses to start without one.
+          echo "JWT_SECRET=$(openssl rand -base64 48)" > .env
+          docker compose up -d --build
+
+      - name: Wait until the API answers
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3001/api/health; then exit 0; fi
+            sleep 2
+          done
+          echo "The store did not come up in time"
+          docker compose -f store/docker-compose.yml logs api
+          exit 1
+
+      - name: Seed the catalogue
+        working-directory: store
+        run: docker compose exec -T api npm run seed
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Regression suite
+        run: mvn -B test -DbaseUrl=http://localhost:3001
+
+      - name: Known bugs (expected to fail)
+        if: always()
+        continue-on-error: true
+        run: >
+          mvn -B test -DbaseUrl=http://localhost:3001
+          -Dcucumber.filter.tags="@known-bug"
+          -Dcucumber.plugin="pretty, html:target/known-bugs-report.html"
+
+      - name: Store logs
+        if: failure()
+        run: docker compose -f store/docker-compose.yml logs api
+
+      - name: Publish reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cucumber-reports
+          path: |
+            target/cucumber-report.html
+            target/known-bugs-report.html
+            target/cucumber.json
